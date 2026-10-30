@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.3.0
-// @description  Export conversations, visible agent activity and Mistral Vibe task plans with completeness warnings.
+// @version      4.4.0
+// @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
 // @match        https://chatgpt.com/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.3.0') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.4.0') return;
 
-  const VERSION = '4.3.0';
+  const VERSION = '4.4.0';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -189,24 +189,38 @@
   }
 
   const mistral = {
-    root: () => document.querySelector('[data-chat-shell-root]') || document,
-    rows: () => all(document, '[data-thread-item-key][data-message-author-role]'),
-    key: row => row.getAttribute('data-thread-item-key'),
+    // Vibe Code uses data-thread-item-key; Vibe Work uses data-message-id.
+    // Keep both selectors explicit and scoped to recognized conversation layouts.
+    root: () => document.querySelector('[data-chat-shell-root]')
+      || document.querySelector('[data-testid="conversation-layout"]') || document,
+    rows: () => [
+      ...all(document, '[data-thread-item-key][data-message-author-role]'),
+      ...all(document, '[data-testid="conversation-layout"] [data-message-id][data-message-author-role]')
+    ].filter(row => ['user', 'assistant'].includes(row.getAttribute('data-message-author-role'))),
+    key: row => row.getAttribute('data-thread-item-key') || row.getAttribute('data-message-id'),
     index: () => null,
-    toggles: () => distinct([
-      ...all(document, '[data-thread-item-key] [data-testid="harness-steps-summary"]')
-        .map(el => el.closest('button[aria-expanded="false"]')).filter(Boolean),
-      ...all(document, '[data-thread-item-key] [data-step-state]')
-        .map(el => el.closest('[data-state]')?.querySelector('button[aria-controls][aria-expanded="false"]'))
-        .filter(Boolean)
-    ]),
+    toggles: () => {
+      const buttons = [];
+      for (const row of mistral.rows()) {
+        // Both Work and Code have agent-activity disclosures. Expand the group
+        // before its nested steps; only target conversation controls.
+        buttons.push(...all(row, '[data-testid="harness-steps-summary"]')
+          .map(el => el.closest('button[aria-controls][aria-expanded="false"]')).filter(Boolean));
+        buttons.push(...all(row, '[data-step-state]')
+          .map(el => el.closest('[data-state]')?.querySelector('button[aria-controls][aria-expanded="false"]'))
+          .filter(Boolean));
+      }
+      return distinct(buttons);
+    },
     parse(row, warnings) {
       const role = row.getAttribute('data-message-author-role');
       if (!['user', 'assistant'].includes(role)) throw Error('Unknown Mistral role');
       const parts = [];
       const summaryNodes = all(row, '[data-testid="harness-steps-summary"]');
       const groupRegions = summaryNodes.map(el => panelFor(el.closest('button'))).filter(Boolean);
-      const nodes = all(row, '[data-message-part-type="text"], [data-message-part-type="reasoning"], [data-testid="harness-steps-summary"]');
+      // Work emits answer parts, whereas Code emits text parts.
+      // Preserve the DOM order of responses and activity groups.
+      const nodes = all(row, '[data-message-part-type="text"], [data-message-part-type="answer"], [data-message-part-type="reasoning"], [data-testid="harness-steps-summary"]');
 
       for (const el of nodes) {
         if (groupRegions.some(region => region.contains(el))) continue;
@@ -264,7 +278,9 @@
       }
 
       if (role === 'user' && !parts.length) {
-        const body = row.querySelector('[class~="group/user-message"] .select-text');
+        const body = row.querySelector('[class~="group/user-message"] .select-text')
+          || row.querySelector('.ProseMirror[contenteditable="false"]')
+          || row.querySelector('.rich-text-editor.select-text');
         if (body) parts.push({kind: 'text', value: renderDom(body) || text(body)});
         else warnings.push('Mistral: user message body is missing.');
       }
@@ -466,8 +482,11 @@
   function scroller(anchor) {
     if (PLATFORM === 'mistral') {
       const boxes = all(document, '[data-chat-shell-scroll]');
-      const active = boxes.find(el => el.querySelector('[data-thread-item-key]'));
-      if (active) return active;
+      const active = boxes.find(el => el.querySelector('[data-thread-item-key], [data-message-id][data-message-author-role]'));
+      // A saved/static DOM may contain the shell without its scroll CSS.
+      // Only use it if it is an actual scroll container.
+      if (active && /(auto|scroll)/.test(getComputedStyle(active).overflowY)
+          && active.scrollHeight > active.clientHeight + 2) return active;
     }
     let node = anchor?.nodeType === Node.DOCUMENT_NODE ? document.documentElement : anchor;
     while (isElement(node)) {
