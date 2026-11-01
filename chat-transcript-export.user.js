@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.4.0
+// @version      4.4.1
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.4.0') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.4.1') return;
 
-  const VERSION = '4.4.0';
+  const VERSION = '4.4.1';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -698,18 +698,43 @@
   }
 
   function init() {
-    if (document.getElementById('tm-chat-md-export')) return;
+    // ChatGPT can replace DOM nodes it does not own during client-side navigation.
+    // Mount outside the app's body subtree and restore the host if it is removed.
+    const hostId = 'tm-chat-md-export-host';
+    if (document.getElementById(hostId)) return;
+    const host = document.createElement('div');
+    host.id = hostId;
+    Object.assign(host.style, {
+      position: 'fixed', right: '18px', bottom: '18px',
+      zIndex: '2147483647', pointerEvents: 'none'
+    });
+    // Shadow DOM isolates the control from ChatGPT's changing styles.
+    const shadow = host.attachShadow({mode: 'open'});
     const button = document.createElement('button');
     button.id = 'tm-chat-md-export';
     button.type = 'button';
     button.textContent = 'Expand + Export MD';
     Object.assign(button.style, {
-      position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647',
       padding: '10px 14px', background: '#0b74de', color: '#fff', border: '0',
-      borderRadius: '7px', cursor: 'pointer', font: '13px system-ui'
+      borderRadius: '7px', cursor: 'pointer', font: '13px system-ui',
+      pointerEvents: 'auto'
     });
     button.addEventListener('click', () => run(button));
-    document.body.appendChild(button);
+    shadow.appendChild(button);
+
+    const mount = () => {
+      if (!host.isConnected && document.documentElement) {
+        document.documentElement.appendChild(host);
+      }
+    };
+    mount();
+
+    // Observing the document (rather than just the old body) also survives
+    // body replacement. Reinsert only when detached to avoid mutation loops.
+    const observer = new MutationObserver(() => {
+      if (!host.isConnected) mount();
+    });
+    observer.observe(document, {childList: true, subtree: true});
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, {once: true});
