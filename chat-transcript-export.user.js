@@ -885,12 +885,32 @@
         try {subagents = await captureChatGPTSubagents(warnings);}
         catch (error) {warnings.push('ChatGPT: subagent capture failed: ' + error.message);}
       }
+      const triggerMissing = warnings.includes('ChatGPT: Subagents menu trigger not found in the page.');
       button.textContent = 'Reading conversation…';
       let messages = [];
       if (PLATFORM === 'chatgpt') {
         try {messages = await captureChatGPT(warnings);}
         catch (error) {warnings.push('ChatGPT: main conversation capture failed: ' + error.message);}
       } else messages = await captureOthers(warnings);
+      if (PLATFORM === 'chatgpt' && triggerMissing) {
+        // A virtualized thread may only mount its summary near the bottom.
+        button.textContent = 'Retrying subagents…';
+        const absent = 'ChatGPT: Subagents menu trigger not found in the page.';
+        warnings.splice(warnings.indexOf(absent), 1);
+        const scroll = chatgpt.root() ? scrollAPI(chatgpt.root()) : null;
+        const originalPosition = scroll?.top();
+        try {
+          if (scroll) {
+            scroll.set(scroll.maximum());
+            await sleep(350);
+          }
+          subagents = await captureChatGPTSubagents(warnings);
+        } catch (error) {
+          warnings.push('ChatGPT: subagent retry failed: ' + error.message);
+        } finally {
+          if (scroll) scroll.set(originalPosition);
+        }
+      }
       // Re-read after scrolling in case the task statuses changed during export.
       if (PLATFORM === 'mistral') plan = mistralPlan(warnings) || plan;
       let result = writeMarkdown(messages, warnings, plan, subagents);
