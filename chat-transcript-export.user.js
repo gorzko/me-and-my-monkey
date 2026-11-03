@@ -752,7 +752,7 @@
   // The sidebar summary can be localized; avoid silently skipping its trigger.
   function subagentTrigger() {
     return all(document, 'button[data-slot="thread-summary-panel-item-button"]')
-      .find(button => /^(?:agenty podrzędne|subagenci|subagents)\\b/i.test(
+      .find(button => /^(?:agenty podrzędne|subagenci|subagents)(?:\s|$)/i.test(
         text(button.querySelector('[data-marquee-content]'))
           || compact(button.getAttribute('aria-label')) || text(button)
       ));
