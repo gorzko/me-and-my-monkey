@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.7
+// @version      4.5.8
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.7') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.8') return;
 
-  const VERSION = '4.5.7';
+  const VERSION = '4.5.8';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -162,9 +162,9 @@
         if (agent.status) out.push('Status: ' + agent.status, '');
         if (agent.answer) out.push('### Final answer', '', agent.answer, '');
         else if (agent.answerState === 'unavailable') {
-          out.push('_Final answer unavailable._', '', 'UI message: ' + agent.answerNote, '');
+          out.push('_No final answer in the subagent panel._', '', 'UI message: ' + agent.answerNote, '');
         } else if (agent.answerState === 'timeout') {
-          out.push('_Timed out waiting for the final answer._', '');
+          out.push('_Timed out while loading the final answer._', '');
         } else out.push('_No readable final answer was available in the panel._', '');
       }
     }
@@ -717,45 +717,36 @@
     return null;
   }
 
-  // A final-answer section is created before its content is hydrated.
-  // Wait for the actual answer or for a terminal UI message, not the heading.
-  async function waitForSubagentAnswer(timeout = 120000) {
+
+  // The heading appears before the final answer has been fetched.
+  // Read the answer section itself, not a particular markdown wrapper.
+  async function waitForSubagentAnswer(timeout = 10000) {
     const deadline = Date.now() + timeout;
-    let candidate = null, candidateSince = 0;
-    let lastMessage = '';
-    while (Date.now() < deadline) {
+    let candidate = '', candidateSince = 0;
+    do {
       const section = subagentFinalSection();
-      if (section) {
-        const body = section.querySelector('h2')?.nextElementSibling || section;
-        const content = body.querySelector('[data-markdown-text-style="assistant-message"]');
-        const contentText = compact(content?.textContent);
-        const status = compact(body.textContent);
-        if (status) lastMessage = status;
+      const body = section?.querySelector('h2')?.nextElementSibling;
+      const value = compact(body?.textContent);
 
-        // The placeholder is plain text; do not mistake it for an answer.
-        const loading = /^(?:wczytywanie|ładowanie|pobieranie|loading|fetching)\b/i.test(status);
-        // The exact no-answer text can vary. Only clear absence/error
-        // messages are terminal; other interim messages keep us waiting.
-        const unavailable = /brak|nie\s+(?:znalezion|udało|ma\b)|niedostępn|missing|unavailable|not found|not available|failed|no\s+(?:final|answer|response)/i.test(status);
-        // The UI's "Brak odpowiedzi końcowej." is a terminal state.
-        if (!contentText && !loading && unavailable) {
-          return {state: 'unavailable', answer: '', note: status};
-        }
-
-        const fingerprint = contentText && !loading ? 'answer:' + contentText : null;
-        if (fingerprint !== candidate) {
-          candidate = fingerprint;
+      // Both messages are rendered as ordinary text in the answer body.
+      if (/^(?:brak odpowiedzi końcowej|no final (?:answer|response)(?: available)?)[.]?$/i.test(value)) {
+        return {state: 'unavailable', answer: '', note: value};
+      }
+      const loading = /^(?:wczytywanie końcowej odpowiedzi|loading (?:the )?final (?:answer|response))[.…]*$/i.test(value);
+      if (value && !loading) {
+        if (value !== candidate) {
+          candidate = value;
           candidateSince = Date.now();
-        } else if (fingerprint && Date.now() - candidateSince >= 800) {
-          const answer = clean(renderDom(content));
+        } else if (Date.now() - candidateSince >= 300) {
+          const answer = clean(renderDom(body));
           if (answer) return {state: 'answer', answer, note: ''};
         }
-      } else {
-        candidate = null;
-      }
-      await sleep(180);
-    }
-    return {state: 'timeout', answer: '', note: lastMessage};
+      } else candidate = '';
+      await sleep(150);
+    } while (Date.now() < deadline);
+
+    const body = subagentFinalSection()?.querySelector('h2')?.nextElementSibling;
+    return {state: 'timeout', answer: '', note: compact(body?.textContent)};
   }
 
   async function captureChatGPTSubagents(warnings) {
@@ -828,10 +819,8 @@
         }
         const final = await waitForSubagentAnswer();
         if (final.state === 'timeout') {
-          warnings.push('ChatGPT: timed out waiting for final answer from ' + task.name +
+          warnings.push('ChatGPT: final answer did not load for subagent: ' + task.name +
             (final.note ? ' (last UI message: ' + final.note + ')' : ''));
-        } else if (final.state === 'unavailable') {
-          warnings.push('ChatGPT: final answer unavailable for ' + task.name + ': ' + final.note);
         }
         found.push({...task, answer: final.answer, answerState: final.state, answerNote: final.note});
 
