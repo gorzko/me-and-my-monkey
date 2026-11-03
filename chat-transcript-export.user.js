@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.8
+// @version      4.5.9
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.8') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.9') return;
 
-  const VERSION = '4.5.8';
+  const VERSION = '4.5.9';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -716,7 +716,11 @@
   async function captureChatGPTSubagents(warnings) {
     if (PLATFORM !== 'chatgpt') return [];
     const trigger = all(document, 'button[data-slot="thread-summary-panel-item-button"]')
-      .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne');
+      .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne')
+      // Some layouts omit the summary menu. An activity name opens the same
+      // panel directly in detail view; initialBack below restores its list.
+      || all(document, '[data-testid="chatgpt-subagent-activity"] [role="button"]')
+        .find(button => button.getClientRects().length > 0);
     const alreadyOpen = Boolean(subagentPanel());
     if (!trigger && !alreadyOpen) return [];
 
