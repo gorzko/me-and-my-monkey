@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.10
+// @version      4.5.11
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.10') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.11') return;
 
-  const VERSION = '4.5.10';
+  const VERSION = '4.5.11';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -161,7 +161,11 @@
         out.push('## ' + agent.name.replace(/[\r\n#]+/g, ' ').trim(), '');
         if (agent.status) out.push('Status: ' + agent.status, '');
         if (agent.answer) out.push('### Final answer', '', agent.answer, '');
-        else out.push('_No readable final answer was available in the panel._', '');
+        else if (agent.answerState === 'missing')
+          out.push('_ChatGPT reports: ' + agent.panelMessage + '_', '');
+        else if (agent.answerState === 'timeout')
+          out.push('_Final answer was still loading after 45 seconds; its absence is not confirmed._', '');
+        else out.push('_Agent details could not be read; see export limitations._', '');
       }
     }
     return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
@@ -713,6 +717,41 @@
     return null;
   }
 
+  function subagentFinalSnapshot() {
+    const section = subagentFinalSection();
+    const body = section?.querySelector('h2')?.nextElementSibling;
+    const value = compact(body?.textContent);
+    if (!value || /^(wczytywanie|loading)/i.test(value))
+      return {answer: '', answerState: 'loading', panelMessage: value};
+    if (/^(brak odpowiedzi końcowej|no final (?:answer|response))\.?$/i.test(value))
+      return {answer: '', answerState: 'missing', panelMessage: value};
+    const content = body.querySelector('[data-markdown-text-style="assistant-message"]') || body;
+    const answer = clean(renderDom(content));
+    return {answer, answerState: answer ? 'ready' : 'loading', panelMessage: ''};
+  }
+
+  async function readSubagentFinalAnswer(name, warnings) {
+    const started = Date.now();
+    const result = await waitFor(() => {
+      const snapshot = subagentFinalSnapshot();
+      const seconds = Math.floor((Date.now() - started) / 1000);
+      const button = document.getElementById('tm-chat-md-export-host')
+        ?.shadowRoot?.querySelector('button');
+      if (button) button.textContent = 'Agent: ' + name + ' (' + seconds + '/45 s) v' + VERSION;
+      return snapshot.answerState !== 'loading' ? snapshot : null;
+    }, 45000);
+    if (result) {
+      if (result.answerState === 'missing')
+        warnings.push('ChatGPT explicitly reports no final answer for subagent: ' + name);
+      return result;
+    }
+    const snapshot = subagentFinalSnapshot();
+    // Check again at the deadline so a late response is not discarded.
+    if (snapshot.answerState !== 'loading') return snapshot;
+    warnings.push('ChatGPT: final answer still loading after 45 seconds for subagent: ' + name);
+    return {...snapshot, answerState: 'timeout'};
+  }
+
   async function captureChatGPTActivityAgents(warnings) {
     const selector = '[data-testid="chatgpt-subagent-activity"] [role="button"]';
     const links = () => all(document, selector);
@@ -747,25 +786,12 @@
           }, 8000);
           if (!detail) throw Error('requested agent detail did not open');
           record(name, 'waiting for final answer');
-          const result = await waitFor(() => {
-            const section = subagentFinalSection();
-            const body = section?.querySelector('h2')?.nextElementSibling;
-            const value = compact(body?.textContent);
-            if (!value || /^(wczytywanie|loading)/i.test(value)) return null;
-            if (/^(brak odpowiedzi końcowej|no final (?:answer|response))\.?$/i.test(value))
-              return {answer: '', missing: true};
-            // The response need not carry the Markdown-specific attribute.
-            const content = body.querySelector('[data-markdown-text-style="assistant-message"]') || body;
-            const answer = clean(renderDom(content));
-            return answer ? {answer} : null;
-          }, 15000);
+          const result = await readSubagentFinalAnswer(name, warnings);
           const statusSection = all(subagentPanel(), 'section').find(section =>
             /^status$/i.test(text(section.querySelector('h2'))));
           const status = text(statusSection?.querySelector('h2')?.nextElementSibling);
-          found.push({name, status, answer: result?.answer || ''});
-          if (!result) warnings.push('ChatGPT: final answer timed out for subagent: ' + name);
-          else if (result.missing) warnings.push('ChatGPT: no final answer for subagent: ' + name);
-          record(name, !result ? 'timeout' : result.missing ? 'no final answer' : 'captured');
+          found.push({name, status, ...result});
+          record(name, result.answerState);
         } catch (error) {
           warnings.push('ChatGPT: subagent ' + name + ': ' + error.message);
           found.push({name, answer: ''});
@@ -852,24 +878,8 @@
           found.push({...task, answer: ''});
           continue;
         }
-        // The section can appear before its response. Re-read it while loading,
-        // since React may replace the section rather than update the same node.
-        let missing = false;
-        const answer = await waitFor(() => {
-          const section = subagentFinalSection();
-          const content = section?.querySelector('[data-markdown-text-style="assistant-message"]');
-          const value = clean(renderDom(content));
-          if (value) return value;
-          const body = compact(section?.querySelector('h2')?.nextElementSibling?.textContent);
-          if (/^(brak odpowiedzi końcowej\.|no final (?:answer|response)\.)$/i.test(body)) {
-            missing = true;
-            return {missing: true};
-          }
-          return null;
-        }, 15000);
-        if (!answer) warnings.push('ChatGPT: final answer timed out for subagent: ' + task.name);
-        else if (missing) warnings.push('ChatGPT: no final answer for subagent: ' + task.name);
-        found.push({...task, answer: typeof answer === 'string' ? answer : ''});
+        const response = await readSubagentFinalAnswer(task.name, warnings);
+        found.push({...task, ...response});
 
         const back = subagentBack();
         if (back) {
