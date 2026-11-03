@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.4.1
+// @version      4.5.0
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.4.1') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.0') return;
 
-  const VERSION = '4.4.1';
+  const VERSION = '4.5.0';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -117,7 +117,7 @@
       .find(el => el.getAttribute('aria-labelledby') === button.id) || null;
   }
 
-  function writeMarkdown(messages, warnings, plan = null) {
+  function writeMarkdown(messages, warnings, plan = null, subagents = []) {
     const out = [
       '# Chat transcript', '',
       `Source: ${location.href}`, `Platform: ${PLATFORM}`,
@@ -153,6 +153,15 @@
         } else if (p.kind === 'tool') out.push(`### 🔧 Tool activity${p.label ? ` — ${p.label}` : ''}`, '', p.value || '', '');
         else if (p.kind === 'step') out.push(`### ⚙ Agent step${p.label ? ` — ${p.label}` : ''}`, '', p.value || '', '');
         else if (p.kind === 'event') out.push(`### ◇ Event${p.label ? ` — ${p.label}` : ''}`, '', p.value || '', '');
+      }
+    }
+    if (PLATFORM === 'chatgpt' && subagents.length) {
+      out.push('---', '', '# Subagents (final responses)', '');
+      for (const agent of subagents) {
+        out.push('## ' + agent.name.replace(/[\r\n#]+/g, ' ').trim(), '');
+        if (agent.status) out.push('Status: ' + agent.status, '');
+        if (agent.answer) out.push('### Final answer', '', agent.answer, '');
+        else out.push('_No readable final answer was available in the panel._', '');
       }
     }
     return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
@@ -665,6 +674,146 @@
     return entries.flatMap(([, data]) => data.messages);
   }
 
+  // ChatGPT subagents are exposed in the right panel, not in transcript turns.
+  const subagentPanel = () => document.querySelector(
+    'aside [role="tabpanel"][aria-label="Subagenci"][data-app-shell-tab-panel-controller="right"]'
+  );
+  const subagentButtons = () => all(
+    subagentPanel(), '[data-slot="thread-summary-panel-item-group"] > button'
+  );
+  const subagentBack = () => subagentPanel()?.querySelector(
+    'button[aria-label="Powrót do subagentów"]'
+  );
+
+  function subagentName(button) {
+    const leaf = all(button, 'span').find(el =>
+      !el.children.length && compact(el.textContent));
+    return compact(leaf?.textContent) || compact(button.textContent) || 'Unnamed subagent';
+  }
+
+  function subagentStatus(button, name) {
+    const leafTexts = all(button, 'span').filter(el => !el.children.length)
+      .map(el => compact(el.textContent)).filter(Boolean);
+    return leafTexts.filter(value => value !== name).pop() || '';
+  }
+
+  function subagentFinalSection() {
+    return all(subagentPanel(), 'section').find(section =>
+      /^(odpowiedź końcowa|final answer)$/i.test(text(section.querySelector('h2')))
+    ) || null;
+  }
+
+  async function waitFor(predicate, timeout = 7000) {
+    const deadline = Date.now() + timeout;
+    do {
+      const item = predicate();
+      if (item) return item;
+      await sleep(140);
+    } while (Date.now() < deadline);
+    return null;
+  }
+
+  async function captureChatGPTSubagents(warnings) {
+    if (PLATFORM !== 'chatgpt') return [];
+    const trigger = all(document, 'button[data-slot="thread-summary-panel-item-button"]')
+      .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne');
+    const alreadyOpen = Boolean(subagentPanel());
+    if (!trigger && !alreadyOpen) return [];
+
+    let opened = false;
+    const found = [];
+    const count = Number(
+      text(trigger?.querySelector('[data-slot="thread-summary-panel-item-meta"]')).match(/\d+/)?.[0] || 0
+    );
+    try {
+      if (!alreadyOpen) {
+        trigger.click();
+        opened = true;
+      }
+      if (!await waitFor(subagentPanel, 8000)) {
+        warnings.push('ChatGPT: the Subagents panel did not open.');
+        return found;
+      }
+
+      // Restore the list if a subagent was already selected by the user.
+      const initialBack = subagentBack();
+      const originalName = initialBack
+        ? compact(initialBack.parentElement?.querySelector('span')?.textContent) : '';
+      if (initialBack) {
+        initialBack.click();
+        await waitFor(() => subagentButtons().length > 0, 6000);
+      }
+      await waitFor(() => subagentPanel()?.querySelector('[data-app-shell-pane-content-viewport="true"]'), 5000);
+      await sleep(300);
+      const listed = subagentButtons();
+      if (count > listed.length) warnings.push(
+        'ChatGPT: summary reports ' + count + ' subagents, but only ' +
+        listed.length + ' were listed.');
+      if (!listed.length) return found;
+
+      const counts = new Map();
+      const tasks = listed.map((button, position) => {
+        const name = subagentName(button);
+        const occurrence = counts.get(name) || 0;
+        counts.set(name, occurrence + 1);
+        return {name, position, occurrence, status: subagentStatus(button, name)};
+      });
+
+      for (const task of tasks) {
+        if (subagentBack()) {
+          subagentBack().click();
+          await waitFor(() => subagentButtons().length > 0, 6000);
+        }
+        const current = subagentButtons();
+        let button = current[task.position];
+        if (!button || subagentName(button) !== task.name) {
+          button = current.filter(b => subagentName(b) === task.name)[task.occurrence];
+        }
+        if (!button) {
+          warnings.push('ChatGPT: missing subagent in the list: ' + task.name);
+          found.push({...task, answer: ''});
+          continue;
+        }
+
+        button.click();
+        if (!await waitFor(() => subagentBack() && subagentPanel(), 8000)) {
+          warnings.push('ChatGPT: could not open subagent: ' + task.name);
+          found.push({...task, answer: ''});
+          continue;
+        }
+        const section = await waitFor(subagentFinalSection, 4000);
+        const content = section?.querySelector('[data-markdown-text-style="assistant-message"]');
+        const answer = clean(renderDom(content));
+        if (!answer) warnings.push('ChatGPT: no visible final answer for subagent: ' + task.name);
+        found.push({...task, answer});
+
+        const back = subagentBack();
+        if (back) {
+          back.click();
+          if (!await waitFor(() => subagentButtons().length > 0, 7000)) {
+            warnings.push('ChatGPT: could not return to list after ' + task.name);
+            break;
+          }
+        }
+      }
+
+      if (!opened && originalName && !subagentBack()) {
+        const original = subagentButtons().find(b => subagentName(b) === originalName);
+        if (original) original.click();
+      }
+      return found;
+    } finally {
+      // Leave existing panels alone; close only one opened for this export.
+      if (opened) {
+        if (subagentBack()) {
+          subagentBack().click();
+          await waitFor(() => subagentButtons().length > 0, 3000);
+        }
+        subagentPanel()?.closest('aside')?.querySelector('button[aria-label="Zamknij panel"]')?.click();
+      }
+    }
+  }
+
   function download(value) {
     const filename = `${(document.title || 'chat').replace(/[\\/:*?"<>|]/g, '').slice(0, 80)}_${PLATFORM}_${new Date().toISOString().replace(/[:.]/g, '-')}.md`;
     const url = URL.createObjectURL(new Blob([value], {type: 'text/markdown;charset=utf-8'}));
@@ -681,14 +830,20 @@
       const warnings = [];
       let plan = mistralPlan(warnings);
       const messages = PLATFORM === 'chatgpt' ? await captureChatGPT(warnings) : await captureOthers(warnings);
+      // The main conversation must be read before opening the subagent panel.
+      let subagents = [];
+      if (PLATFORM === 'chatgpt') {
+        try {subagents = await captureChatGPTSubagents(warnings);}
+        catch (error) {warnings.push('ChatGPT: subagent capture failed: ' + error.message);}
+      }
       // Re-read after scrolling in case the task statuses changed during export.
       if (PLATFORM === 'mistral') plan = mistralPlan(warnings) || plan;
-      let result = writeMarkdown(messages, warnings, plan);
+      let result = writeMarkdown(messages, warnings, plan, subagents);
       try {await navigator.clipboard.writeText(result);}
-      catch {warnings.push('Clipboard copy failed; the downloaded Markdown remains available.'); result = writeMarkdown(messages, warnings, plan);}
+      catch {warnings.push('Clipboard copy failed; the downloaded Markdown remains available.'); result = writeMarkdown(messages, warnings, plan, subagents);}
       download(result);
       button.textContent = warnings.length ? 'Exported (warnings in MD)' : 'Exported MD';
-      console.info('[Chat transcript]', {version: VERSION, platform: PLATFORM, messages: messages.length, planTasks: plan?.tasks.length || 0, warnings: distinct(warnings)});
+      console.info('[Chat transcript]', {version: VERSION, platform: PLATFORM, messages: messages.length, planTasks: plan?.tasks.length || 0, subagents: subagents.length, warnings: distinct(warnings)});
     } catch (error) {
       console.error('[Chat transcript] Export failed:', error);
       button.textContent = 'Export failed (console)';
