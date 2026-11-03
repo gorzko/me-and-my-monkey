@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.4
+// @version      4.5.5
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.4') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.5') return;
 
-  const VERSION = '4.5.4';
+  const VERSION = '4.5.5';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -527,7 +527,7 @@
       (p.value?.length || 0) + (p.command?.length || 0) + (p.output?.length || 0) + 10, 0), 0);
   }
 
-  async function captureChatGPT(warnings) {
+  async function captureChatGPT(warnings, onProgress = () => {}) {
     const root = chatgpt.root();
     if (!root) throw Error('ChatGPT conversation root not found. Open a conversation first.');
     const scroll = scrollAPI(root);
@@ -535,6 +535,7 @@
     const collected = new Map(), observed = new Map();
     let stable = 0, lastMax = -1, reachedBottom = false;
     const started = Date.now();
+    onProgress('chat', 'Main chat: scanning');
     const harvest = () => {
       for (const row of chatgpt.rows()) {
         const key = chatgpt.key(row);
@@ -553,6 +554,7 @@
       await sleep(350);
       for (let i = 0; i < 1000 && Date.now() - started < 120000; i++) {
         harvest();
+        if (i % 5 === 0) onProgress('chat', `Main chat: ${collected.size} turns`);
         await expand([]);
         harvest();
         const max = scroll.maximum();
@@ -761,13 +763,17 @@
     return {state: 'timeout', answer: '', note: lastMessage};
   }
 
-  async function captureChatGPTSubagents(warnings) {
+  async function captureChatGPTSubagents(warnings, onProgress = () => {}) {
     if (PLATFORM !== 'chatgpt') return [];
     const trigger = all(document, 'button[data-slot="thread-summary-panel-item-button"]')
       .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne');
     const alreadyOpen = Boolean(subagentPanel());
-    if (!trigger && !alreadyOpen) return [];
+    if (!trigger && !alreadyOpen) {
+      onProgress('agents', 'Subagents: not listed');
+      return [];
+    }
 
+    onProgress('agents', 'Subagents: opening panel');
     let opened = false;
     const found = [];
     const count = Number(
@@ -798,6 +804,7 @@
         'ChatGPT: summary reports ' + count + ' subagents, but only ' +
         listed.length + ' were listed.');
       if (!listed.length) return found;
+      onProgress('agents', `Subagents: ${listed.length} listed`);
 
       const counts = new Map();
       const tasks = listed.map((button, position) => {
@@ -808,6 +815,8 @@
       });
 
       for (const task of tasks) {
+        onProgress('agent:' + task.position,
+          `Subagent ${task.position + 1}/${tasks.length}: ${task.name}`);
         if (subagentBack()) {
           subagentBack().click();
           await waitFor(() => subagentButtons().length > 0, 6000);
@@ -876,22 +885,50 @@
 
   async function run(button) {
     button.disabled = true;
-    button.textContent = 'Expanding and exporting…';
+    let stage = '', title = 'Preparing export', since = Date.now();
+    const displayProgress = () => {
+      const seconds = Math.floor((Date.now() - since) / 1000);
+      button.textContent = `${title} (${seconds}s)`;
+      if (window.TMChatExport) {
+        window.TMChatExport.progress = {stage, title, elapsedSeconds: seconds};
+      }
+    };
+    const onProgress = (key, label) => {
+      if (stage !== key) {
+        stage = key;
+        since = Date.now();
+        console.info('[Chat transcript] Stage:', label);
+      }
+      title = label;
+      displayProgress();
+    };
+    const timer = setInterval(displayProgress, 1000);
     try {
       const warnings = [];
       let plan = mistralPlan(warnings);
-      const messages = PLATFORM === 'chatgpt' ? await captureChatGPT(warnings) : await captureOthers(warnings);
+      onProgress('chat', 'Main chat: scanning');
+      const messages = PLATFORM === 'chatgpt'
+        ? await captureChatGPT(warnings, onProgress)
+        : await captureOthers(warnings);
       // The main conversation must be read before opening the subagent panel.
       let subagents = [];
       if (PLATFORM === 'chatgpt') {
-        try {subagents = await captureChatGPTSubagents(warnings);}
+        try {subagents = await captureChatGPTSubagents(warnings, onProgress);}
         catch (error) {warnings.push('ChatGPT: subagent capture failed: ' + error.message);}
       }
       // Re-read after scrolling in case the task statuses changed during export.
       if (PLATFORM === 'mistral') plan = mistralPlan(warnings) || plan;
+      onProgress('saving', 'Saving Markdown');
       let result = writeMarkdown(messages, warnings, plan, subagents);
-      try {await navigator.clipboard.writeText(result);}
-      catch {warnings.push('Clipboard copy failed; the downloaded Markdown remains available.'); result = writeMarkdown(messages, warnings, plan, subagents);}
+      try {
+        await Promise.race([
+          navigator.clipboard.writeText(result),
+          sleep(5000).then(() => {throw Error('Clipboard request timed out.');})
+        ]);
+      } catch {
+        warnings.push('Clipboard copy failed or timed out; the downloaded Markdown remains available.');
+        result = writeMarkdown(messages, warnings, plan, subagents);
+      }
       download(result);
       button.textContent = warnings.length ? 'Exported (warnings in MD)' : 'Exported MD';
       console.info('[Chat transcript]', {version: VERSION, platform: PLATFORM, messages: messages.length, planTasks: plan?.tasks.length || 0, subagents: subagents.length, warnings: distinct(warnings)});
@@ -899,6 +936,8 @@
       console.error('[Chat transcript] Export failed:', error);
       button.textContent = 'Export failed (console)';
     } finally {
+      clearInterval(timer);
+      if (window.TMChatExport) window.TMChatExport.progress = null;
       setTimeout(() => {button.disabled = false; button.textContent = 'Expand + Export MD';}, 4000);
     }
   }
