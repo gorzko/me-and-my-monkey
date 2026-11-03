@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.9
+// @version      4.5.10
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.9') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.10') return;
 
-  const VERSION = '4.5.9';
+  const VERSION = '4.5.10';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -161,11 +161,7 @@
         out.push('## ' + agent.name.replace(/[\r\n#]+/g, ' ').trim(), '');
         if (agent.status) out.push('Status: ' + agent.status, '');
         if (agent.answer) out.push('### Final answer', '', agent.answer, '');
-        else if (agent.answerState === 'unavailable') {
-          out.push('_No final answer in the subagent panel._', '', 'UI message: ' + agent.answerNote, '');
-        } else if (agent.answerState === 'timeout') {
-          out.push('_Timed out while loading the final answer._', '');
-        } else out.push('_No readable final answer was available in the panel._', '');
+        else out.push('_No readable final answer was available in the panel._', '');
       }
     }
     return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
@@ -717,55 +713,12 @@
     return null;
   }
 
-
-  // The heading appears before the final answer has been fetched.
-  // Read the answer section itself, not a particular markdown wrapper.
-  async function waitForSubagentAnswer(timeout = 10000) {
-    const deadline = Date.now() + timeout;
-    let candidate = '', candidateSince = 0;
-    do {
-      const section = subagentFinalSection();
-      const body = section?.querySelector('h2')?.nextElementSibling;
-      const value = compact(body?.textContent);
-
-      // Both messages are rendered as ordinary text in the answer body.
-      if (/^(?:brak odpowiedzi końcowej|no final (?:answer|response)(?: available)?)[.]?$/i.test(value)) {
-        return {state: 'unavailable', answer: '', note: value};
-      }
-      const loading = /^(?:wczytywanie końcowej odpowiedzi|loading (?:the )?final (?:answer|response))[.…]*$/i.test(value);
-      if (value && !loading) {
-        if (value !== candidate) {
-          candidate = value;
-          candidateSince = Date.now();
-        } else if (Date.now() - candidateSince >= 300) {
-          const answer = clean(renderDom(body));
-          if (answer) return {state: 'answer', answer, note: ''};
-        }
-      } else candidate = '';
-      await sleep(150);
-    } while (Date.now() < deadline);
-
-    const body = subagentFinalSection()?.querySelector('h2')?.nextElementSibling;
-    return {state: 'timeout', answer: '', note: compact(body?.textContent)};
-  }
-
-  // The sidebar summary can be localized; avoid silently skipping its trigger.
-  function subagentTrigger() {
-    return all(document, 'button[data-slot="thread-summary-panel-item-button"]')
-      .find(button => /^(?:agenty podrzędne|subagenci|subagents)(?:\s|$)/i.test(
-        text(button.querySelector('[data-marquee-content]'))
-          || compact(button.getAttribute('aria-label')) || text(button)
-      ));
-  }
-
   async function captureChatGPTSubagents(warnings) {
     if (PLATFORM !== 'chatgpt') return [];
-    const trigger = subagentTrigger();
+    const trigger = all(document, 'button[data-slot="thread-summary-panel-item-button"]')
+      .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne');
     const alreadyOpen = Boolean(subagentPanel());
-    if (!trigger && !alreadyOpen) {
-      warnings.push('ChatGPT: Subagents menu trigger not found in the page.');
-      return [];
-    }
+    if (!trigger && !alreadyOpen) return [];
 
     let opened = false;
     const found = [];
@@ -828,12 +781,29 @@
           found.push({...task, answer: ''});
           continue;
         }
-        const final = await waitForSubagentAnswer();
-        if (final.state === 'timeout') {
-          warnings.push('ChatGPT: final answer did not load for subagent: ' + task.name +
-            (final.note ? ' (last UI message: ' + final.note + ')' : ''));
-        }
-        found.push({...task, answer: final.answer, answerState: final.state, answerNote: final.note});
+        // The final-answer heading exists before its body has finished loading.
+        // Keep the v4.5.0 panel navigation unchanged; wait only for this body.
+        let previousAnswer = '', stableSince = 0;
+        const result = await waitFor(() => {
+          const section = subagentFinalSection();
+          const body = section?.querySelector('h2')?.nextElementSibling;
+          const message = compact(body?.textContent);
+          if (/^(?:Brak odpowiedzi końcowej|No final (?:answer|response)(?: available)?)\.?$/i.test(message)) {
+            return {answer: '', unavailable: true};
+          }
+          if (/^(?:Wczytywanie końcowej odpowiedzi|Loading (?:the )?final (?:answer|response))/i.test(message)) return null;
+          const content = body?.querySelector('[data-markdown-text-style="assistant-message"]');
+          const answer = clean(renderDom(content));
+          if (!answer) return null;
+          if (answer !== previousAnswer) {
+            previousAnswer = answer;
+            stableSince = Date.now();
+          }
+          return Date.now() - stableSince >= 300 ? {answer} : null;
+        }, 10000);
+        const answer = result?.answer || '';
+        if (!result) warnings.push('ChatGPT: final answer did not load for subagent: ' + task.name);
+        found.push({...task, answer});
 
         const back = subagentBack();
         if (back) {
@@ -877,39 +847,12 @@
     try {
       const warnings = [];
       let plan = mistralPlan(warnings);
-      // Subagents are captured first: lengthy transcript scrolling must not block
-      // their panel from ever opening, and an unreadable main chat must not skip them.
+      const messages = PLATFORM === 'chatgpt' ? await captureChatGPT(warnings) : await captureOthers(warnings);
+      // The main conversation must be read before opening the subagent panel.
       let subagents = [];
       if (PLATFORM === 'chatgpt') {
-        button.textContent = 'Reading subagents…';
         try {subagents = await captureChatGPTSubagents(warnings);}
         catch (error) {warnings.push('ChatGPT: subagent capture failed: ' + error.message);}
-      }
-      const triggerMissing = warnings.includes('ChatGPT: Subagents menu trigger not found in the page.');
-      button.textContent = 'Reading conversation…';
-      let messages = [];
-      if (PLATFORM === 'chatgpt') {
-        try {messages = await captureChatGPT(warnings);}
-        catch (error) {warnings.push('ChatGPT: main conversation capture failed: ' + error.message);}
-      } else messages = await captureOthers(warnings);
-      if (PLATFORM === 'chatgpt' && triggerMissing) {
-        // A virtualized thread may only mount its summary near the bottom.
-        button.textContent = 'Retrying subagents…';
-        const absent = 'ChatGPT: Subagents menu trigger not found in the page.';
-        warnings.splice(warnings.indexOf(absent), 1);
-        const scroll = chatgpt.root() ? scrollAPI(chatgpt.root()) : null;
-        const originalPosition = scroll?.top();
-        try {
-          if (scroll) {
-            scroll.set(scroll.maximum());
-            await sleep(350);
-          }
-          subagents = await captureChatGPTSubagents(warnings);
-        } catch (error) {
-          warnings.push('ChatGPT: subagent retry failed: ' + error.message);
-        } finally {
-          if (scroll) scroll.set(originalPosition);
-        }
       }
       // Re-read after scrolling in case the task statuses changed during export.
       if (PLATFORM === 'mistral') plan = mistralPlan(warnings) || plan;
