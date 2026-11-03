@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.3
+// @version      4.5.4
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.3') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.4') return;
 
-  const VERSION = '4.5.3';
+  const VERSION = '4.5.4';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -721,7 +721,7 @@
   // Wait for the actual answer or for a terminal UI message, not the heading.
   // A "no final answer" message can precede delayed hydration.
   // Keep watching for a real response before treating it as unavailable.
-  async function waitForSubagentAnswer(timeout = 120000, missingGrace = 20000) {
+  async function waitForSubagentAnswer(timeout = 120000) {
     const deadline = Date.now() + timeout;
     let candidate = null, candidateSince = 0;
     let lastMessage = '';
@@ -739,25 +739,19 @@
         // The exact no-answer text can vary. Only clear absence/error
         // messages are terminal; other interim messages keep us waiting.
         const unavailable = /brak|nie\s+(?:znalezion|udało|ma\b)|niedostępn|missing|unavailable|not found|not available|failed|no\s+(?:final|answer|response)/i.test(status);
-        const next = contentText && !loading
-          ? {state: 'answer', key: contentText}
-          : status && !loading && unavailable
-            ? {state: 'unavailable', key: status}
-            : null;
+        // "Brak odpowiedzi końcowej." is definitive in the ChatGPT UI.
+        // Do not wait for hydration or a stability grace period in this state.
+        if (!contentText && !loading && unavailable) {
+          return {state: 'unavailable', answer: '', note: status};
+        }
 
-        const fingerprint = next ? next.state + ':' + next.key : null;
+        const fingerprint = contentText && !loading ? 'answer:' + contentText : null;
         if (fingerprint !== candidate) {
           candidate = fingerprint;
           candidateSince = Date.now();
-        } else if (next) {
-          const stableFor = Date.now() - candidateSince;
-          if (next.state === 'unavailable' && stableFor >= missingGrace) {
-            return {state: 'unavailable', answer: '', note: status};
-          }
-          if (next.state === 'answer' && stableFor >= 800) {
-            const answer = clean(renderDom(content));
-            if (answer) return {state: 'answer', answer, note: ''};
-          }
+        } else if (fingerprint && Date.now() - candidateSince >= 800) {
+          const answer = clean(renderDom(content));
+          if (answer) return {state: 'answer', answer, note: ''};
         }
       } else {
         candidate = null;
