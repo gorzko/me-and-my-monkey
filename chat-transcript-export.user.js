@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.11
+// @version      4.5.12
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.11') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.12') return;
 
-  const VERSION = '4.5.11';
+  const VERSION = '4.5.12';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -161,8 +161,6 @@
         out.push('## ' + agent.name.replace(/[\r\n#]+/g, ' ').trim(), '');
         if (agent.status) out.push('Status: ' + agent.status, '');
         if (agent.answer) out.push('### Final answer', '', agent.answer, '');
-        else if (agent.answerState === 'missing')
-          out.push('_ChatGPT reports: ' + agent.panelMessage + '_', '');
         else if (agent.answerState === 'timeout')
           out.push('_Final answer was still loading after 45 seconds; its absence is not confirmed._', '');
         else out.push('_Agent details could not be read; see export limitations._', '');
@@ -724,7 +722,7 @@
     if (!value || /^(wczytywanie|loading)/i.test(value))
       return {answer: '', answerState: 'loading', panelMessage: value};
     if (/^(brak odpowiedzi końcowej|no final (?:answer|response))\.?$/i.test(value))
-      return {answer: '', answerState: 'missing', panelMessage: value};
+      return {answer: value, answerState: 'ready', panelMessage: value};
     const content = body.querySelector('[data-markdown-text-style="assistant-message"]') || body;
     const answer = clean(renderDom(content));
     return {answer, answerState: answer ? 'ready' : 'loading', panelMessage: ''};
@@ -740,11 +738,7 @@
       if (button) button.textContent = 'Agent: ' + name + ' (' + seconds + '/45 s) v' + VERSION;
       return snapshot.answerState !== 'loading' ? snapshot : null;
     }, 45000);
-    if (result) {
-      if (result.answerState === 'missing')
-        warnings.push('ChatGPT explicitly reports no final answer for subagent: ' + name);
-      return result;
-    }
+    if (result) return result;
     const snapshot = subagentFinalSnapshot();
     // Check again at the deadline so a late response is not discarded.
     if (snapshot.answerState !== 'loading') return snapshot;
