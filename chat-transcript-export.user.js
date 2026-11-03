@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.5
+// @version      4.5.6
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.5') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.6') return;
 
-  const VERSION = '4.5.5';
+  const VERSION = '4.5.6';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -472,27 +472,42 @@
   const adapter = PLATFORM === 'mistral' ? mistral : PLATFORM === 'claude' ? claude : chatgpt;
   const unresponsive = new WeakSet();
 
-  async function expand(warnings, limit = 30) {
-    for (let pass = 0; pass < limit; pass++) {
+  async function expand(warnings, limit = 30, budget = {}) {
+    // Expanding a large agent turn must not block the outer time limit.
+    const deadline = Math.min(
+      Number.isFinite(budget.deadline) ? budget.deadline : Infinity,
+      Number.isFinite(budget.maxMs) ? Date.now() + budget.maxMs : Infinity
+    );
+    const maxClicks = Number.isFinite(budget.maxClicks) ? budget.maxClicks : Infinity;
+    let clicked = 0, limited = false;
+    outer: for (let pass = 0; pass < limit; pass++) {
+      if (Date.now() >= deadline || clicked >= maxClicks) {limited = true; break;}
       const controls = adapter.toggles().filter(b => b.isConnected && !unresponsive.has(b));
       if (!controls.length) break;
       let changed = false;
       for (const button of controls) {
+        if (Date.now() >= deadline || clicked >= maxClicks) {limited = true; break outer;}
         if (!button.isConnected || button.getAttribute('aria-expanded') !== 'false') continue;
-        // Programmatic clicks work offscreen; scrolling to every button would disrupt virtualization.
         button.click();
-        await sleep(PLATFORM === 'chatgpt' ? 160 : 85);
+        clicked++;
+        await sleep(PLATFORM === 'chatgpt' ? 90 : 85);
         if (button.getAttribute('aria-expanded') === 'true') changed = true;
         else unresponsive.add(button);
       }
       if (!changed) break;
     }
-    const remaining = adapter.toggles().filter(b => b.isConnected);
-    if (remaining.length) warnings.push(`${PLATFORM}: ${remaining.length} known controls remain collapsed.`);
+    const remaining = adapter.toggles().filter(b => b.isConnected && !unresponsive.has(b));
+    if (remaining.length && !limited) warnings.push(`${PLATFORM}: ${remaining.length} known controls remain collapsed.`);
+    return {clicked, limited, remaining: remaining.length};
   }
 
   // A Document is not an Element. Never pass document to getComputedStyle.
   function scroller(anchor) {
+    if (PLATFORM === 'chatgpt') {
+      const host = anchor?.closest?.('[data-mcp-app-scroll-host="true"]');
+      if (host && /(auto|scroll)/.test(getComputedStyle(host).overflowY)
+          && host.scrollHeight > host.clientHeight + 2) return host;
+    }
     if (PLATFORM === 'mistral') {
       const boxes = all(document, '[data-chat-shell-scroll]');
       const active = boxes.find(el => el.querySelector('[data-thread-item-key], [data-message-id][data-message-author-role]'));
@@ -534,7 +549,8 @@
     const original = scroll.top();
     const collected = new Map(), observed = new Map();
     let stable = 0, lastMax = -1, reachedBottom = false;
-    const started = Date.now();
+    const started = Date.now(), deadline = started + 120000;
+    let cappedExpansions = 0;
     onProgress('chat', 'Main chat: scanning');
     const harvest = () => {
       for (const row of chatgpt.rows()) {
@@ -552,11 +568,21 @@
     try {
       scroll.set(0);
       await sleep(350);
-      for (let i = 0; i < 1000 && Date.now() - started < 120000; i++) {
+      for (let i = 0; i < 1000 && Date.now() < deadline; i++) {
         harvest();
-        if (i % 5 === 0) onProgress('chat', `Main chat: ${collected.size} turns`);
-        await expand([]);
-        harvest();
+        if (i % 4 === 0) onProgress('chat',
+          `Main chat: ${collected.size} turns; scroll ${Math.round(scroll.top())}/${Math.round(scroll.maximum())}`);
+        // The UI can expose hundreds of nested controls in one virtualized turn.
+        // Retry the current viewport briefly, never exceeding the global deadline.
+        for (let batch = 0; batch < 2 && Date.now() < deadline; batch++) {
+          const result = await expand([], 30, {deadline, maxMs: 2000, maxClicks: 12});
+          harvest();
+          if (result.limited && result.remaining) {
+            cappedExpansions++;
+            onProgress('chat', `Main chat: ${collected.size} turns; expanding (${result.remaining} left)`);
+          } else break;
+        }
+        if (Date.now() >= deadline) break;
         const max = scroll.maximum();
         const bottom = scroll.top() >= max - 2;
         stable = bottom && max === lastMax ? stable + 1 : 0;
@@ -567,12 +593,17 @@
       }
       harvest();
       for (const [key, {row}] of observed) {
+        if (Date.now() >= deadline) break;
         if (collected.has(key) || !row.isConnected) continue;
         row.scrollIntoView({block: 'center'});
-        for (let i = 0; i < 8 && !collected.has(key); i++) {await sleep(200); harvest();}
+        for (let i = 0; i < 8 && !collected.has(key) && Date.now() < deadline; i++) {
+          await sleep(200); harvest();
+        }
       }
     } finally {scroll.set(original);}
     if (!observed.size) throw Error('No supported ChatGPT message structure detected.');
+    if (cappedExpansions) warnings.push(
+      `ChatGPT: ${cappedExpansions} disclosure expansion batches reached time/click limits; some activity details may be missing.`);
     if (!reachedBottom) warnings.push('ChatGPT: bottom of conversation not confirmed.');
     const missing = [...observed.keys()].filter(key => !collected.has(key));
     if (missing.length) warnings.push(`ChatGPT: ${missing.length} unhydrated turn(s): ${missing.slice(0, 6).join(', ')}`);
