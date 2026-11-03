@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.2
+// @version      4.5.3
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.2') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.3') return;
 
-  const VERSION = '4.5.2';
+  const VERSION = '4.5.3';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -719,7 +719,9 @@
 
   // A final-answer section is created before its content is hydrated.
   // Wait for the actual answer or for a terminal UI message, not the heading.
-  async function waitForSubagentAnswer(timeout = 30000) {
+  // A "no final answer" message can precede delayed hydration.
+  // Keep watching for a real response before treating it as unavailable.
+  async function waitForSubagentAnswer(timeout = 120000, missingGrace = 20000) {
     const deadline = Date.now() + timeout;
     let candidate = null, candidateSince = 0;
     let lastMessage = '';
@@ -747,12 +749,15 @@
         if (fingerprint !== candidate) {
           candidate = fingerprint;
           candidateSince = Date.now();
-        } else if (next && Date.now() - candidateSince >= 800) {
-          if (next.state === 'unavailable') {
+        } else if (next) {
+          const stableFor = Date.now() - candidateSince;
+          if (next.state === 'unavailable' && stableFor >= missingGrace) {
             return {state: 'unavailable', answer: '', note: status};
           }
-          const answer = clean(renderDom(content));
-          if (answer) return {state: 'answer', answer, note: ''};
+          if (next.state === 'answer' && stableFor >= 800) {
+            const answer = clean(renderDom(content));
+            if (answer) return {state: 'answer', answer, note: ''};
+          }
         }
       } else {
         candidate = null;
