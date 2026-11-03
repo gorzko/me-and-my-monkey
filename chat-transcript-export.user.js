@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.9
+// @version      4.5.10
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.9') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.10') return;
 
-  const VERSION = '4.5.9';
+  const VERSION = '4.5.10';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -713,14 +713,81 @@
     return null;
   }
 
+  async function captureChatGPTActivityAgents(warnings) {
+    const selector = '[data-testid="chatgpt-subagent-activity"] [role="button"]';
+    const links = () => all(document, selector);
+    const names = distinct(links().map(button => compact(button.textContent)));
+    const found = [];
+    const existing = subagentPanel();
+    const originalName = compact(subagentBack()?.parentElement?.querySelector('span')?.textContent);
+    const trace = window.TMChatExportAgentDebug = [];
+    const record = (name, stage) => {
+      trace.push({name, stage});
+      console.info('[Chat transcript agents]', name, stage);
+    };
+    if (!names.length) {
+      warnings.push('ChatGPT: no subagent menu or activity links found; agent capture could not be verified.');
+      return found;
+    }
+    try {
+      for (const name of names) {
+        record(name, 'opening');
+        try {
+          // Re-query: scrolling and opening panels can replace conversation nodes.
+          const link = links().find(button => compact(button.textContent) === name);
+          if (!link) throw Error('activity link disappeared');
+          link.scrollIntoView({block: 'center'});
+          await sleep(200);
+          const current = links().find(button => compact(button.textContent) === name);
+          if (!current) throw Error('activity link disappeared after scrolling');
+          current.click();
+          const detail = await waitFor(() => {
+            const back = subagentBack();
+            return back && compact(back.parentElement?.querySelector('span')?.textContent) === name;
+          }, 8000);
+          if (!detail) throw Error('requested agent detail did not open');
+          record(name, 'waiting for final answer');
+          const result = await waitFor(() => {
+            const section = subagentFinalSection();
+            const body = section?.querySelector('h2')?.nextElementSibling;
+            const value = compact(body?.textContent);
+            if (!value || /^(wczytywanie|loading)/i.test(value)) return null;
+            if (/^(brak odpowiedzi końcowej|no final (?:answer|response))\.?$/i.test(value))
+              return {answer: '', missing: true};
+            // The response need not carry the Markdown-specific attribute.
+            const content = body.querySelector('[data-markdown-text-style="assistant-message"]') || body;
+            const answer = clean(renderDom(content));
+            return answer ? {answer} : null;
+          }, 15000);
+          const statusSection = all(subagentPanel(), 'section').find(section =>
+            /^status$/i.test(text(section.querySelector('h2'))));
+          const status = text(statusSection?.querySelector('h2')?.nextElementSibling);
+          found.push({name, status, answer: result?.answer || ''});
+          if (!result) warnings.push('ChatGPT: final answer timed out for subagent: ' + name);
+          else if (result.missing) warnings.push('ChatGPT: no final answer for subagent: ' + name);
+          record(name, !result ? 'timeout' : result.missing ? 'no final answer' : 'captured');
+        } catch (error) {
+          warnings.push('ChatGPT: subagent ' + name + ': ' + error.message);
+          found.push({name, answer: ''});
+          record(name, error.message);
+        }
+      }
+    } finally {
+      if (!existing) subagentPanel()?.closest('aside')
+        ?.querySelector('button[aria-label="Zamknij panel"]')?.click();
+      else if (originalName) {
+        links().find(button => compact(button.textContent) === originalName)?.click();
+      } else subagentBack()?.click();
+    }
+    return found;
+  }
+
   async function captureChatGPTSubagents(warnings) {
     if (PLATFORM !== 'chatgpt') return [];
     const trigger = all(document, 'button[data-slot="thread-summary-panel-item-button"]')
-      .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne')
-      // Some layouts omit the summary menu. An activity name opens the same
-      // panel directly in detail view; initialBack below restores its list.
-      || all(document, '[data-testid="chatgpt-subagent-activity"] [role="button"]')
-        .find(button => button.getClientRects().length > 0);
+      .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne');
+    // Activity links open each agent directly; no list selectors are needed.
+    if (!trigger) return captureChatGPTActivityAgents(warnings);
     const alreadyOpen = Boolean(subagentPanel());
     if (!trigger && !alreadyOpen) return [];
 
@@ -846,10 +913,12 @@
     try {
       const warnings = [];
       let plan = mistralPlan(warnings);
+      button.textContent = 'Reading conversation… v' + VERSION;
       const messages = PLATFORM === 'chatgpt' ? await captureChatGPT(warnings) : await captureOthers(warnings);
       // The main conversation must be read before opening the subagent panel.
       let subagents = [];
       if (PLATFORM === 'chatgpt') {
+        button.textContent = 'Reading agents… v' + VERSION;
         try {subagents = await captureChatGPTSubagents(warnings);}
         catch (error) {warnings.push('ChatGPT: subagent capture failed: ' + error.message);}
       }
