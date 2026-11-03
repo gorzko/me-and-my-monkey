@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.1
+// @version      4.5.2
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.1') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.2') return;
 
-  const VERSION = '4.5.1';
+  const VERSION = '4.5.2';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -734,9 +734,12 @@
 
         // The placeholder is plain text; do not mistake it for an answer.
         const loading = /^(?:wczytywanie|ładowanie|pobieranie|loading|fetching)\b/i.test(status);
+        // The exact no-answer text can vary. Only clear absence/error
+        // messages are terminal; other interim messages keep us waiting.
+        const unavailable = /brak|nie\s+(?:znalezion|udało|ma\b)|niedostępn|missing|unavailable|not found|not available|failed|no\s+(?:final|answer|response)/i.test(status);
         const next = contentText && !loading
           ? {state: 'answer', key: contentText}
-          : status && !loading
+          : status && !loading && unavailable
             ? {state: 'unavailable', key: status}
             : null;
 
