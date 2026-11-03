@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.8
+// @version      4.5.9
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.8') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.9') return;
 
-  const VERSION = '4.5.8';
+  const VERSION = '4.5.9';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -749,12 +749,23 @@
     return {state: 'timeout', answer: '', note: compact(body?.textContent)};
   }
 
+  // The sidebar summary can be localized; avoid silently skipping its trigger.
+  function subagentTrigger() {
+    return all(document, 'button[data-slot="thread-summary-panel-item-button"]')
+      .find(button => /^(?:agenty podrzędne|subagenci|subagents)\\b/i.test(
+        text(button.querySelector('[data-marquee-content]'))
+          || compact(button.getAttribute('aria-label')) || text(button)
+      ));
+  }
+
   async function captureChatGPTSubagents(warnings) {
     if (PLATFORM !== 'chatgpt') return [];
-    const trigger = all(document, 'button[data-slot="thread-summary-panel-item-button"]')
-      .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne');
+    const trigger = subagentTrigger();
     const alreadyOpen = Boolean(subagentPanel());
-    if (!trigger && !alreadyOpen) return [];
+    if (!trigger && !alreadyOpen) {
+      warnings.push('ChatGPT: Subagents menu trigger not found in the page.');
+      return [];
+    }
 
     let opened = false;
     const found = [];
@@ -866,13 +877,20 @@
     try {
       const warnings = [];
       let plan = mistralPlan(warnings);
-      const messages = PLATFORM === 'chatgpt' ? await captureChatGPT(warnings) : await captureOthers(warnings);
-      // The main conversation must be read before opening the subagent panel.
+      // Subagents are captured first: lengthy transcript scrolling must not block
+      // their panel from ever opening, and an unreadable main chat must not skip them.
       let subagents = [];
       if (PLATFORM === 'chatgpt') {
+        button.textContent = 'Reading subagents…';
         try {subagents = await captureChatGPTSubagents(warnings);}
         catch (error) {warnings.push('ChatGPT: subagent capture failed: ' + error.message);}
       }
+      button.textContent = 'Reading conversation…';
+      let messages = [];
+      if (PLATFORM === 'chatgpt') {
+        try {messages = await captureChatGPT(warnings);}
+        catch (error) {warnings.push('ChatGPT: main conversation capture failed: ' + error.message);}
+      } else messages = await captureOthers(warnings);
       // Re-read after scrolling in case the task statuses changed during export.
       if (PLATFORM === 'mistral') plan = mistralPlan(warnings) || plan;
       let result = writeMarkdown(messages, warnings, plan, subagents);
