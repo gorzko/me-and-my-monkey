@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chat Transcript → Markdown (Mistral Vibe + Claude + ChatGPT)
 // @namespace    local.chat-transcript-export
-// @version      4.5.6
+// @version      4.5.7
 // @description  Export Mistral Vibe Code/Work, Claude and ChatGPT conversations and agent activity.
 // @match        https://chat.mistral.ai/*
 // @match        https://claude.ai/chat/*
@@ -16,9 +16,9 @@
   const PLATFORM = location.hostname === 'chat.mistral.ai' ? 'mistral'
     : location.hostname === 'claude.ai' ? 'claude'
     : location.hostname === 'chatgpt.com' ? 'chatgpt' : null;
-  if (!PLATFORM || window.TMChatExport?.version === '4.5.6') return;
+  if (!PLATFORM || window.TMChatExport?.version === '4.5.7') return;
 
-  const VERSION = '4.5.6';
+  const VERSION = '4.5.7';
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const all = (root, selector) => root ? [...root.querySelectorAll(selector)] : [];
   const clean = value => String(value ?? '').replace(/\r\n?/g, '\n').trim();
@@ -472,42 +472,27 @@
   const adapter = PLATFORM === 'mistral' ? mistral : PLATFORM === 'claude' ? claude : chatgpt;
   const unresponsive = new WeakSet();
 
-  async function expand(warnings, limit = 30, budget = {}) {
-    // Expanding a large agent turn must not block the outer time limit.
-    const deadline = Math.min(
-      Number.isFinite(budget.deadline) ? budget.deadline : Infinity,
-      Number.isFinite(budget.maxMs) ? Date.now() + budget.maxMs : Infinity
-    );
-    const maxClicks = Number.isFinite(budget.maxClicks) ? budget.maxClicks : Infinity;
-    let clicked = 0, limited = false;
-    outer: for (let pass = 0; pass < limit; pass++) {
-      if (Date.now() >= deadline || clicked >= maxClicks) {limited = true; break;}
+  async function expand(warnings, limit = 30) {
+    for (let pass = 0; pass < limit; pass++) {
       const controls = adapter.toggles().filter(b => b.isConnected && !unresponsive.has(b));
       if (!controls.length) break;
       let changed = false;
       for (const button of controls) {
-        if (Date.now() >= deadline || clicked >= maxClicks) {limited = true; break outer;}
         if (!button.isConnected || button.getAttribute('aria-expanded') !== 'false') continue;
+        // Programmatic clicks work offscreen; scrolling to every button would disrupt virtualization.
         button.click();
-        clicked++;
-        await sleep(PLATFORM === 'chatgpt' ? 90 : 85);
+        await sleep(PLATFORM === 'chatgpt' ? 160 : 85);
         if (button.getAttribute('aria-expanded') === 'true') changed = true;
         else unresponsive.add(button);
       }
       if (!changed) break;
     }
-    const remaining = adapter.toggles().filter(b => b.isConnected && !unresponsive.has(b));
-    if (remaining.length && !limited) warnings.push(`${PLATFORM}: ${remaining.length} known controls remain collapsed.`);
-    return {clicked, limited, remaining: remaining.length};
+    const remaining = adapter.toggles().filter(b => b.isConnected);
+    if (remaining.length) warnings.push(`${PLATFORM}: ${remaining.length} known controls remain collapsed.`);
   }
 
   // A Document is not an Element. Never pass document to getComputedStyle.
   function scroller(anchor) {
-    if (PLATFORM === 'chatgpt') {
-      const host = anchor?.closest?.('[data-mcp-app-scroll-host="true"]');
-      if (host && /(auto|scroll)/.test(getComputedStyle(host).overflowY)
-          && host.scrollHeight > host.clientHeight + 2) return host;
-    }
     if (PLATFORM === 'mistral') {
       const boxes = all(document, '[data-chat-shell-scroll]');
       const active = boxes.find(el => el.querySelector('[data-thread-item-key], [data-message-id][data-message-author-role]'));
@@ -542,16 +527,14 @@
       (p.value?.length || 0) + (p.command?.length || 0) + (p.output?.length || 0) + 10, 0), 0);
   }
 
-  async function captureChatGPT(warnings, onProgress = () => {}) {
+  async function captureChatGPT(warnings) {
     const root = chatgpt.root();
     if (!root) throw Error('ChatGPT conversation root not found. Open a conversation first.');
     const scroll = scrollAPI(root);
     const original = scroll.top();
     const collected = new Map(), observed = new Map();
     let stable = 0, lastMax = -1, reachedBottom = false;
-    const started = Date.now(), deadline = started + 120000;
-    let cappedExpansions = 0;
-    onProgress('chat', 'Main chat: scanning');
+    const started = Date.now();
     const harvest = () => {
       for (const row of chatgpt.rows()) {
         const key = chatgpt.key(row);
@@ -568,21 +551,10 @@
     try {
       scroll.set(0);
       await sleep(350);
-      for (let i = 0; i < 1000 && Date.now() < deadline; i++) {
+      for (let i = 0; i < 1000 && Date.now() - started < 120000; i++) {
         harvest();
-        if (i % 4 === 0) onProgress('chat',
-          `Main chat: ${collected.size} turns; scroll ${Math.round(scroll.top())}/${Math.round(scroll.maximum())}`);
-        // The UI can expose hundreds of nested controls in one virtualized turn.
-        // Retry the current viewport briefly, never exceeding the global deadline.
-        for (let batch = 0; batch < 2 && Date.now() < deadline; batch++) {
-          const result = await expand([], 30, {deadline, maxMs: 2000, maxClicks: 12});
-          harvest();
-          if (result.limited && result.remaining) {
-            cappedExpansions++;
-            onProgress('chat', `Main chat: ${collected.size} turns; expanding (${result.remaining} left)`);
-          } else break;
-        }
-        if (Date.now() >= deadline) break;
+        await expand([]);
+        harvest();
         const max = scroll.maximum();
         const bottom = scroll.top() >= max - 2;
         stable = bottom && max === lastMax ? stable + 1 : 0;
@@ -593,17 +565,12 @@
       }
       harvest();
       for (const [key, {row}] of observed) {
-        if (Date.now() >= deadline) break;
         if (collected.has(key) || !row.isConnected) continue;
         row.scrollIntoView({block: 'center'});
-        for (let i = 0; i < 8 && !collected.has(key) && Date.now() < deadline; i++) {
-          await sleep(200); harvest();
-        }
+        for (let i = 0; i < 8 && !collected.has(key); i++) {await sleep(200); harvest();}
       }
     } finally {scroll.set(original);}
     if (!observed.size) throw Error('No supported ChatGPT message structure detected.');
-    if (cappedExpansions) warnings.push(
-      `ChatGPT: ${cappedExpansions} disclosure expansion batches reached time/click limits; some activity details may be missing.`);
     if (!reachedBottom) warnings.push('ChatGPT: bottom of conversation not confirmed.');
     const missing = [...observed.keys()].filter(key => !collected.has(key));
     if (missing.length) warnings.push(`ChatGPT: ${missing.length} unhydrated turn(s): ${missing.slice(0, 6).join(', ')}`);
@@ -752,8 +719,6 @@
 
   // A final-answer section is created before its content is hydrated.
   // Wait for the actual answer or for a terminal UI message, not the heading.
-  // A "no final answer" message can precede delayed hydration.
-  // Keep watching for a real response before treating it as unavailable.
   async function waitForSubagentAnswer(timeout = 120000) {
     const deadline = Date.now() + timeout;
     let candidate = null, candidateSince = 0;
@@ -772,8 +737,7 @@
         // The exact no-answer text can vary. Only clear absence/error
         // messages are terminal; other interim messages keep us waiting.
         const unavailable = /brak|nie\s+(?:znalezion|udało|ma\b)|niedostępn|missing|unavailable|not found|not available|failed|no\s+(?:final|answer|response)/i.test(status);
-        // "Brak odpowiedzi końcowej." is definitive in the ChatGPT UI.
-        // Do not wait for hydration or a stability grace period in this state.
+        // The UI's "Brak odpowiedzi końcowej." is a terminal state.
         if (!contentText && !loading && unavailable) {
           return {state: 'unavailable', answer: '', note: status};
         }
@@ -794,17 +758,13 @@
     return {state: 'timeout', answer: '', note: lastMessage};
   }
 
-  async function captureChatGPTSubagents(warnings, onProgress = () => {}) {
+  async function captureChatGPTSubagents(warnings) {
     if (PLATFORM !== 'chatgpt') return [];
     const trigger = all(document, 'button[data-slot="thread-summary-panel-item-button"]')
       .find(button => text(button.querySelector('[data-marquee-content]')) === 'Agenty podrzędne');
     const alreadyOpen = Boolean(subagentPanel());
-    if (!trigger && !alreadyOpen) {
-      onProgress('agents', 'Subagents: not listed');
-      return [];
-    }
+    if (!trigger && !alreadyOpen) return [];
 
-    onProgress('agents', 'Subagents: opening panel');
     let opened = false;
     const found = [];
     const count = Number(
@@ -835,7 +795,6 @@
         'ChatGPT: summary reports ' + count + ' subagents, but only ' +
         listed.length + ' were listed.');
       if (!listed.length) return found;
-      onProgress('agents', `Subagents: ${listed.length} listed`);
 
       const counts = new Map();
       const tasks = listed.map((button, position) => {
@@ -846,8 +805,6 @@
       });
 
       for (const task of tasks) {
-        onProgress('agent:' + task.position,
-          `Subagent ${task.position + 1}/${tasks.length}: ${task.name}`);
         if (subagentBack()) {
           subagentBack().click();
           await waitFor(() => subagentButtons().length > 0, 6000);
@@ -916,50 +873,22 @@
 
   async function run(button) {
     button.disabled = true;
-    let stage = '', title = 'Preparing export', since = Date.now();
-    const displayProgress = () => {
-      const seconds = Math.floor((Date.now() - since) / 1000);
-      button.textContent = `${title} (${seconds}s)`;
-      if (window.TMChatExport) {
-        window.TMChatExport.progress = {stage, title, elapsedSeconds: seconds};
-      }
-    };
-    const onProgress = (key, label) => {
-      if (stage !== key) {
-        stage = key;
-        since = Date.now();
-        console.info('[Chat transcript] Stage:', label);
-      }
-      title = label;
-      displayProgress();
-    };
-    const timer = setInterval(displayProgress, 1000);
+    button.textContent = 'Expanding and exporting…';
     try {
       const warnings = [];
       let plan = mistralPlan(warnings);
-      onProgress('chat', 'Main chat: scanning');
-      const messages = PLATFORM === 'chatgpt'
-        ? await captureChatGPT(warnings, onProgress)
-        : await captureOthers(warnings);
+      const messages = PLATFORM === 'chatgpt' ? await captureChatGPT(warnings) : await captureOthers(warnings);
       // The main conversation must be read before opening the subagent panel.
       let subagents = [];
       if (PLATFORM === 'chatgpt') {
-        try {subagents = await captureChatGPTSubagents(warnings, onProgress);}
+        try {subagents = await captureChatGPTSubagents(warnings);}
         catch (error) {warnings.push('ChatGPT: subagent capture failed: ' + error.message);}
       }
       // Re-read after scrolling in case the task statuses changed during export.
       if (PLATFORM === 'mistral') plan = mistralPlan(warnings) || plan;
-      onProgress('saving', 'Saving Markdown');
       let result = writeMarkdown(messages, warnings, plan, subagents);
-      try {
-        await Promise.race([
-          navigator.clipboard.writeText(result),
-          sleep(5000).then(() => {throw Error('Clipboard request timed out.');})
-        ]);
-      } catch {
-        warnings.push('Clipboard copy failed or timed out; the downloaded Markdown remains available.');
-        result = writeMarkdown(messages, warnings, plan, subagents);
-      }
+      try {await navigator.clipboard.writeText(result);}
+      catch {warnings.push('Clipboard copy failed; the downloaded Markdown remains available.'); result = writeMarkdown(messages, warnings, plan, subagents);}
       download(result);
       button.textContent = warnings.length ? 'Exported (warnings in MD)' : 'Exported MD';
       console.info('[Chat transcript]', {version: VERSION, platform: PLATFORM, messages: messages.length, planTasks: plan?.tasks.length || 0, subagents: subagents.length, warnings: distinct(warnings)});
@@ -967,8 +896,6 @@
       console.error('[Chat transcript] Export failed:', error);
       button.textContent = 'Export failed (console)';
     } finally {
-      clearInterval(timer);
-      if (window.TMChatExport) window.TMChatExport.progress = null;
       setTimeout(() => {button.disabled = false; button.textContent = 'Expand + Export MD';}, 4000);
     }
   }
